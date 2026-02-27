@@ -1,19 +1,24 @@
-/* LA Orthos Schedule – static GitHub Pages app
-   - Imports weekly CSV from Excel
-   - Auto builds roster + templates
-   - Allows cell editing via template picker (locked by "Unlock editing")
-   - Publishes to localStorage so staff can view on mobile
+/* LA Orthos Schedule – GitHub Pages (Option B)
+   Shared publishing by committing JSON files to the repo.
 
-   Privacy note: localStorage is per-device. This is best for internal use.
-   If you need shared storage + auth, move this exact app to Azure Static Web Apps with M365 login.
+   Files:
+   /data/index.json -> { "weeks": ["YYYY-MM-DD", ...] }
+   /data/schedules/YYYY-MM-DD.json -> schedule payload
+
+   App behavior:
+   - On load, fetches index.json, picks latest week (first element), loads that schedule.
+   - Week pickers load other weeks if present in index.
+   - Builder "Publish" downloads JSON for you to commit.
 */
 
 const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday"];
 
+const DATA_INDEX_URL = "./data/index.json";
+const DATA_SCHEDULES_DIR = "./data/schedules";
+
 const LS_KEYS = {
-  SCHEDULES: "laorthos_sched_schedules_v1", // map weekOf => {weekOf, roster[], entries{}}
-  ME: "laorthos_sched_me_v1",               // selected personId
-  EDIT: "laorthos_sched_edit_v1",           // edit unlocked
+  ME: "laorthos_sched_me_v1",
+  EDIT: "laorthos_sched_edit_v1",
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -21,28 +26,37 @@ const $ = (sel) => document.querySelector(sel);
 const state = {
   view: "my",
   editUnlocked: false,
-  schedules: loadSchedules(), // { [weekOf]: scheduleObj }
-  currentWeekOf: null,        // yyyy-mm-dd (monday)
-  roster: [],                 // [{id,name,role}]
-  templates: [],              // [{id,raw,parsed:{label,site,start,end,type}}]
-  entries: {},                // { [personId]: { Monday: templateId, ... } }
+
+  // Data loaded from repo:
+  availableWeeks: [],         // ["YYYY-MM-DD", ...]
+  currentWeekOf: null,        // "YYYY-MM-DD"
+  scheduleByWeek: {},         // cache: { [weekOf]: scheduleObj }
+
+  // Working draft in Builder:
+  roster: [],
+  templates: [],
+  entries: {},
 };
 
 init();
 
-function init(){
+async function init(){
   wireTabs();
   wireButtons();
   hydrateEditFlag();
+
+  // Load index.json + latest schedule
+  await bootstrapFromRepo();
+
   initWeekPickers();
   renderAll();
 }
 
+/* ---------------- Tabs ---------------- */
+
 function wireTabs(){
   document.querySelectorAll(".tab").forEach(btn=>{
-    btn.addEventListener("click", ()=>{
-      setView(btn.dataset.view);
-    });
+    btn.addEventListener("click", ()=> setView(btn.dataset.view));
   });
 }
 
@@ -58,9 +72,73 @@ function setView(view){
   });
 }
 
+/* ---------------- Bootstrapping ---------------- */
+
+async function bootstrapFromRepo(){
+  const idx = await fetchIndexJson();
+  state.availableWeeks = idx?.weeks || [];
+
+  // If no weeks exist yet, start on current Monday (draft-only until committed)
+  if(!state.availableWeeks.length){
+    state.currentWeekOf = mondayOf(new Date());
+    state.roster = [];
+    state.templates = defaultTemplates();
+    state.entries = {};
+    toast("No schedules found in /data yet. Import CSV in Builder to start.");
+    return;
+  }
+
+  // Use newest week (first)
+  state.currentWeekOf = state.availableWeeks[0];
+  await loadWeekFromRepo(state.currentWeekOf);
+  applyLoadedWeekToViews(state.currentWeekOf);
+}
+
+async function fetchIndexJson(){
+  try{
+    const res = await fetch(`${DATA_INDEX_URL}?v=${Date.now()}`, { cache: "no-store" });
+    if(!res.ok) throw new Error("index fetch failed");
+    return await res.json();
+  }catch(e){
+    console.warn("Could not load index.json", e);
+    return null;
+  }
+}
+
+async function loadWeekFromRepo(weekOf){
+  if(state.scheduleByWeek[weekOf]) return state.scheduleByWeek[weekOf];
+  try{
+    const res = await fetch(`${DATA_SCHEDULES_DIR}/${weekOf}.json?v=${Date.now()}`, { cache: "no-store" });
+    if(!res.ok) throw new Error("week fetch failed");
+    const sched = await res.json();
+    state.scheduleByWeek[weekOf] = sched;
+    return sched;
+  }catch(e){
+    console.warn(`Could not load week ${weekOf}`, e);
+    return null;
+  }
+}
+
+function applyLoadedWeekToViews(weekOf){
+  const sched = state.scheduleByWeek[weekOf];
+  if(!sched) return;
+
+  // For view screens, we use the loaded schedule.
+  // For Builder, we also load it as the working draft (so edits start from published).
+  state.roster = sched.roster || [];
+  state.templates = (sched.templates || []).map(t => normalizeTemplate(t));
+  state.entries = sched.entries || {};
+}
+
+/* ---------------- Buttons / UI wiring ---------------- */
+
 function wireButtons(){
   $("#btnPickMe").addEventListener("click", openPickMeModal);
-  $("#btnClearMe").addEventListener("click", ()=>{ localStorage.removeItem(LS_KEYS.ME); toast("Cleared your name on this device."); renderMy(); });
+  $("#btnClearMe").addEventListener("click", ()=>{
+    localStorage.removeItem(LS_KEYS.ME);
+    toast("Cleared your name on this device.");
+    renderMy();
+  });
 
   $("#btnPrint").addEventListener("click", ()=> window.print());
   $("#btnExportCSV").addEventListener("click", exportCurrentToCSV);
@@ -72,8 +150,8 @@ function wireButtons(){
     const text = await f.text();
     try{
       const parsed = parseScheduleCSV(text);
-      loadParsedSchedule(parsed);
-      toast("Imported schedule from CSV.");
+      loadParsedDraft(parsed);
+      toast("Imported schedule from CSV (draft). Now click Publish to download JSON.");
       $("#csvFile").value = "";
     }catch(err){
       console.error(err);
@@ -83,14 +161,13 @@ function wireButtons(){
 
   $("#btnEditMode").addEventListener("click", toggleEditMode);
   $("#btnValidate").addEventListener("click", validateCurrent);
-  $("#btnPublish").addEventListener("click", publishCurrent);
+  $("#btnPublish").addEventListener("click", publishDraftToFile);
 
   $("#btnAddTemplate").addEventListener("click", openAddTemplateModal);
 
   // Close modal
   $("#modal").addEventListener("click", (e)=>{
-    const close = e.target?.dataset?.close;
-    if(close) closeModal();
+    if(e.target?.dataset?.close) closeModal();
   });
 }
 
@@ -98,90 +175,44 @@ function hydrateEditFlag(){
   state.editUnlocked = localStorage.getItem(LS_KEYS.EDIT) === "1";
 }
 
-function toggleEditMode(){
-  // Simple local unlock to avoid accidental edits on staff devices.
-  // Change this phrase to anything you want.
-  if(state.editUnlocked){
-    state.editUnlocked = false;
-    localStorage.setItem(LS_KEYS.EDIT, "0");
-    toast("Editing locked.");
-    renderBuilder();
-    return;
-  }
-
-  openModal({
-    title: "Unlock editing",
-    body: `
-      <div class="field" style="min-width:100%">
-        <label>Passphrase</label>
-        <input id="passInput" type="password" placeholder="Enter passphrase" />
-        <div class="hint">Default passphrase: <b>laorthos</b> (change it in app.js)</div>
-      </div>
-    `,
-    foot: `
-      <button class="btn btnGhost" data-close="1">Cancel</button>
-      <button class="btn" id="passOk">Unlock</button>
-    `,
-    onAfter(){
-      $("#passOk").addEventListener("click", ()=>{
-        const val = ($("#passInput").value || "").trim();
-        if(val !== "laorthos"){
-          toast("Wrong passphrase.");
-          return;
-        }
-        state.editUnlocked = true;
-        localStorage.setItem(LS_KEYS.EDIT, "1");
-        closeModal();
-        toast("Editing unlocked on this device.");
-        renderBuilder();
-      });
-    }
-  });
-}
+/* ---------------- Week pickers ---------------- */
 
 function initWeekPickers(){
-  const today = new Date();
-  const weekOf = mondayOf(today);
+  // Default week selection = currentWeekOf
+  $("#myWeekOf").value = state.currentWeekOf;
+  $("#everyoneWeekOf").value = state.currentWeekOf;
+  $("#builderWeekOf").value = state.currentWeekOf;
 
-  $("#myWeekOf").value = weekOf;
-  $("#everyoneWeekOf").value = weekOf;
-  $("#builderWeekOf").value = weekOf;
-
-  $("#myWeekOf").addEventListener("change", ()=>{ setWeek($("#myWeekOf").value); });
-  $("#everyoneWeekOf").addEventListener("change", ()=>{ setWeek($("#everyoneWeekOf").value); renderEveryone(); });
-  $("#builderWeekOf").addEventListener("change", ()=>{ setWeek($("#builderWeekOf").value); renderBuilder(); });
+  $("#myWeekOf").addEventListener("change", async ()=>{ await setWeek($("#myWeekOf").value); });
+  $("#everyoneWeekOf").addEventListener("change", async ()=>{ await setWeek($("#everyoneWeekOf").value); });
+  $("#builderWeekOf").addEventListener("change", async ()=>{ await setWeek($("#builderWeekOf").value); });
 
   $("#roleFilter").addEventListener("change", renderEveryone);
   $("#searchFilter").addEventListener("input", renderEveryone);
-
-  setWeek(weekOf);
 }
 
-function setWeek(dateStr){
+async function setWeek(dateStr){
   if(!dateStr) return;
   const asMon = mondayOf(new Date(dateStr + "T00:00:00"));
   state.currentWeekOf = asMon;
+
   $("#myWeekOf").value = asMon;
   $("#everyoneWeekOf").value = asMon;
   $("#builderWeekOf").value = asMon;
 
-  // Load saved schedule for this week if exists
-  const sched = state.schedules[asMon];
-  if(sched){
-    state.roster = sched.roster;
-    state.templates = sched.templates;
-    state.entries = sched.entries;
-  }else{
-    // Keep whatever is currently loaded, but status reflects no published schedule yet
-    // If nothing loaded, empty
-    if(!state.roster?.length){
-      state.roster = [];
-      state.templates = defaultTemplates();
-      state.entries = {};
-    }
+  // Prefer loading from repo if week exists there
+  if(state.availableWeeks.includes(asMon)){
+    await loadWeekFromRepo(asMon);
+    applyLoadedWeekToViews(asMon);
+  } else {
+    // Week not in index.json (yet). Keep working draft as-is, just change date.
+    toast("That week isn’t in /data/index.json yet. You can build it in Builder and publish a JSON file.");
   }
+
   renderAll();
 }
+
+/* ---------------- Rendering ---------------- */
 
 function renderAll(){
   renderMy();
@@ -189,18 +220,28 @@ function renderAll(){
   renderBuilder();
 }
 
+function getActiveScheduleForViews(){
+  // Views should show repo-loaded schedule if available; if not, show draft.
+  return state.scheduleByWeek[state.currentWeekOf] || {
+    weekOf: state.currentWeekOf,
+    roster: state.roster,
+    templates: state.templates,
+    entries: state.entries,
+  };
+}
+
 function renderMy(){
+  const sched = getActiveScheduleForViews();
   const meId = localStorage.getItem(LS_KEYS.ME);
-  const me = state.roster.find(r=>r.id === meId);
+  const me = (sched.roster || []).find(r=>r.id === meId);
+
   $("#myNamePill").textContent = me ? me.name : "Not selected";
 
-  const sched = state.schedules[state.currentWeekOf];
-  if(!sched){
-    $("#todayCard").innerHTML = `<div class="muted">No published schedule for this week on this device.</div>`;
-    $("#weekCards").innerHTML = `<div class="muted">Ask Alex to open Builder and Publish on this device (or move to shared hosting/auth later).</div>`;
+  if(!sched.roster?.length){
+    $("#todayCard").innerHTML = `<div class="muted">No schedule loaded yet.</div>`;
+    $("#weekCards").innerHTML = `<div class="muted">Ask Alex to publish a schedule JSON to the repo.</div>`;
     return;
   }
-
   if(!me){
     $("#todayCard").innerHTML = `<div class="muted">Select your name to see your assignments.</div>`;
     $("#weekCards").innerHTML = `<div class="muted">Tap “Select my name”.</div>`;
@@ -214,7 +255,7 @@ function renderMy(){
   $("#todayCard").innerHTML = `
     <div style="font-weight:900; color:var(--navy)">${formatLongDate(new Date())}</div>
     <div style="margin-top:6px">${todayName ? `<span class="badge">${todayName}</span>` : ""}</div>
-    <div style="margin-top:10px; font-size:16px; font-weight:900">${todayVal || "No assignment today"}</div>
+    <div style="margin-top:10px; font-size:16px; font-weight:900">${escapeHtml(todayVal || "No assignment today")}</div>
   `;
 
   $("#weekCards").innerHTML = DAYS.map(d=>{
@@ -233,14 +274,14 @@ function renderMy(){
 }
 
 function renderEveryone(){
-  const sched = state.schedules[state.currentWeekOf];
+  const sched = getActiveScheduleForViews();
   const table = $("#everyoneGrid");
   const thead = table.querySelector("thead");
   const tbody = table.querySelector("tbody");
 
-  if(!sched){
+  if(!sched.roster?.length){
     thead.innerHTML = "";
-    tbody.innerHTML = `<tr><td class="muted" style="padding:14px">No published schedule for this week on this device.</td></tr>`;
+    tbody.innerHTML = `<tr><td class="muted" style="padding:14px">No schedule loaded.</td></tr>`;
     return;
   }
 
@@ -279,9 +320,9 @@ function renderEveryone(){
 function renderBuilder(){
   const status = $("#builderStatus");
   const hint = $("#editHint");
-  const sched = state.schedules[state.currentWeekOf];
 
-  status.textContent = sched ? "Published schedule loaded" : (state.roster.length ? "Working draft loaded (not published)" : "No schedule loaded");
+  const isRepoWeek = state.availableWeeks.includes(state.currentWeekOf);
+  status.textContent = isRepoWeek ? "Published week loaded (edit draft from it)" : "Draft week (not in repo yet)";
   hint.textContent = state.editUnlocked ? "Editing unlocked (click cells to assign templates)" : "Locked (view only)";
 
   renderTemplateList();
@@ -306,7 +347,6 @@ function renderTemplateList(){
             <div class="templateMeta">${escapeHtml(meta)}</div>
           </div>
           <div class="templateActions">
-            <button class="iconBtn" title="Use as quick pick" data-quick="${t.id}">⤴︎</button>
             <button class="iconBtn" title="Delete" data-del="${t.id}">🗑</button>
           </div>
         </div>
@@ -319,7 +359,6 @@ function renderTemplateList(){
       if(!state.editUnlocked){ toast("Unlock editing first."); return; }
       const id = btn.dataset.del;
       state.templates = state.templates.filter(x=>x.id !== id);
-      // Also clear any cells using it
       Object.keys(state.entries).forEach(pid=>{
         DAYS.forEach(d=>{
           if(state.entries[pid][d] === id) state.entries[pid][d] = null;
@@ -327,15 +366,6 @@ function renderTemplateList(){
       });
       toast("Template deleted.");
       renderBuilder();
-    });
-  });
-
-  // Quick pick currently just copies template id to clipboard for convenience
-  list.querySelectorAll("[data-quick]").forEach(btn=>{
-    btn.addEventListener("click", async ()=>{
-      const id = btn.dataset.quick;
-      await navigator.clipboard?.writeText(id).catch(()=>{});
-      toast("Template ID copied (optional).");
     });
   });
 }
@@ -383,18 +413,57 @@ function renderBuilderGrid(){
   tbody.querySelectorAll(".cellBtn").forEach(btn=>{
     btn.addEventListener("click", ()=>{
       if(!state.editUnlocked){ return; }
-      const pid = btn.dataset.pid;
-      const day = btn.dataset.day;
-      openCellPicker(pid, day);
+      openCellPicker(btn.dataset.pid, btn.dataset.day);
     });
+  });
+}
+
+/* ---------------- Editor helpers ---------------- */
+
+function toggleEditMode(){
+  if(state.editUnlocked){
+    state.editUnlocked = false;
+    localStorage.setItem(LS_KEYS.EDIT, "0");
+    toast("Editing locked.");
+    renderBuilder();
+    return;
+  }
+
+  openModal({
+    title: "Unlock editing",
+    body: `
+      <div class="field" style="min-width:100%">
+        <label>Passphrase</label>
+        <input id="passInput" type="password" placeholder="Enter passphrase" />
+        <div class="hint">Default passphrase: <b>laorthos</b> (change it in app.js)</div>
+      </div>
+    `,
+    foot: `
+      <button class="btn btnGhost" data-close="1">Cancel</button>
+      <button class="btn" id="passOk">Unlock</button>
+    `,
+    onAfter(){
+      $("#passOk").addEventListener("click", ()=>{
+        const val = ($("#passInput").value || "").trim();
+        if(val !== "laorthos"){
+          toast("Wrong passphrase.");
+          return;
+        }
+        state.editUnlocked = true;
+        localStorage.setItem(LS_KEYS.EDIT, "1");
+        closeModal();
+        toast("Editing unlocked on this device.");
+        renderBuilder();
+      });
+    }
   });
 }
 
 function openCellPicker(personId, day){
   const person = state.roster.find(r=>r.id===personId);
   const templates = state.templates.map(t=>normalizeTemplate(t));
-
   const currentId = state.entries?.[personId]?.[day] || "";
+
   const options = [
     `<option value="">— Clear —</option>`,
     ...templates.map(t=>{
@@ -431,13 +500,10 @@ function openCellPicker(personId, day){
 }
 
 function openPickMeModal(){
-  if(!state.schedules[state.currentWeekOf]){
-    toast("No published schedule for this week on this device yet.");
-  }
-
-  const roster = (state.schedules[state.currentWeekOf]?.roster || state.roster || []);
+  const sched = getActiveScheduleForViews();
+  const roster = sched.roster || [];
   if(!roster.length){
-    toast("Import a weekly CSV first (Builder → Import weekly CSV).");
+    toast("No schedule loaded yet. Ask Alex to publish a schedule JSON to the repo.");
     return;
   }
 
@@ -497,8 +563,7 @@ function openAddTemplateModal(){
       $("#tplSave").addEventListener("click", ()=>{
         const raw = ($("#tplRaw").value || "").trim();
         if(!raw){ toast("Enter template text."); return; }
-        const t = normalizeTemplate({ id: uid("tpl"), raw });
-        state.templates.push(t);
+        state.templates.push(normalizeTemplate({ id: idForRaw(raw), raw }));
         closeModal();
         toast("Template added.");
         renderBuilder();
@@ -507,12 +572,12 @@ function openAddTemplateModal(){
   });
 }
 
-/* Publish / Validate */
+/* ---------------- Validate + Publish (download) ---------------- */
 
 function validateCurrent(){
   if(!state.roster.length){ toast("Nothing to validate."); return; }
-  const issues = [];
 
+  const issues = [];
   state.roster.forEach(r=>{
     const e = state.entries?.[r.id] || {};
     DAYS.forEach(d=>{
@@ -535,28 +600,39 @@ function validateCurrent(){
   });
 }
 
-function publishCurrent(){
+function publishDraftToFile(){
   if(!state.editUnlocked){ toast("Unlock editing first."); return; }
   if(!state.currentWeekOf){ toast("Pick a week."); return; }
   if(!state.roster.length){ toast("Import a weekly CSV first."); return; }
 
-  // Save schedule snapshot into schedules map
-  state.schedules[state.currentWeekOf] = {
+  const payload = {
     weekOf: state.currentWeekOf,
     roster: state.roster,
     templates: state.templates.map(t=>normalizeTemplate(t)),
     entries: state.entries,
     publishedAt: new Date().toISOString(),
   };
-  saveSchedules(state.schedules);
-  toast("Published to this device (local storage).");
-  renderAll();
+
+  const filename = `${state.currentWeekOf}.json`;
+  downloadTextFile(filename, JSON.stringify(payload, null, 2), "application/json");
+
+  openModal({
+    title: "Publish steps (GitHub Pages)",
+    body: `
+      <div class="muted" style="line-height:1.55">
+        <b>1)</b> Take the downloaded file: <b>${escapeHtml(filename)}</b><br>
+        <b>2)</b> Upload/commit it to: <b>/data/schedules/${escapeHtml(filename)}</b><br>
+        <b>3)</b> Update <b>/data/index.json</b> to include <b>${escapeHtml(state.currentWeekOf)}</b> at the front of "weeks"<br><br>
+        After GitHub finishes deploying, staff will see it automatically.
+      </div>
+    `,
+    foot: `<button class="btn" data-close="1">Got it</button>`
+  });
 }
 
-/* CSV Import */
+/* ---------------- CSV Import into draft ---------------- */
 
-function loadParsedSchedule(parsed){
-  // parsed: { weekOf, roster, templates, entries }
+function loadParsedDraft(parsed){
   state.currentWeekOf = parsed.weekOf;
   $("#myWeekOf").value = parsed.weekOf;
   $("#everyoneWeekOf").value = parsed.weekOf;
@@ -566,13 +642,10 @@ function loadParsedSchedule(parsed){
   state.templates = parsed.templates;
   state.entries = parsed.entries;
 
-  // Not auto-publishing — editor chooses Publish
   renderAll();
 }
 
 function parseScheduleCSV(text){
-  // The exported sheet has extra sections.
-  // We find the row that contains "TEAM MEMBER" and "Monday".."Friday", then read downward until blanks.
   const rows = csvToRows(text);
 
   const headerIdx = rows.findIndex(r => (r[0]||"").trim().toUpperCase() === "TEAM MEMBER");
@@ -587,29 +660,21 @@ function parseScheduleCSV(text){
     Thursday: header.findIndex(x=>x.toLowerCase()==="thursday"),
     Friday: header.findIndex(x=>x.toLowerCase()==="friday"),
   };
-
   if(Object.values(dayIdx).some(i=>i<0)) throw new Error("Missing weekday headers.");
 
-  // Find the week label like "03/02/2026- 03/06/2026" above header
+  // Find first date above header like "03/02/2026- 03/06/2026"
   let weekOf = null;
   for(let i=headerIdx-1; i>=0; i--){
     const s = (rows[i][0]||"").trim();
     const m = s.match(/(\d{2}\/\d{2}\/\d{4})/);
-    if(m){
-      weekOf = toISODate(m[1]); // use first date as weekOf
-      break;
-    }
+    if(m){ weekOf = toISODate(m[1]); break; }
   }
-  if(!weekOf){
-    // fallback: monday of today
-    weekOf = mondayOf(new Date());
-  }
+  if(!weekOf) weekOf = mondayOf(new Date());
 
   const roster = [];
   const entries = {};
   const templateRawSet = new Set();
 
-  // Read rows down until team cell is empty for multiple lines
   let emptyCount = 0;
   for(let i=headerIdx+1; i<rows.length; i++){
     const teamCell = (rows[i][dayIdx.TEAM]||"").trim();
@@ -622,7 +687,6 @@ function parseScheduleCSV(text){
     emptyCount = 0;
     if(!teamCell) continue;
 
-    // Detect XR in name prefix "(XR)"
     const role = teamCell.trim().startsWith("(XR)") ? "XR" : "MA";
     const name = teamCell.replace(/^\(XR\)\s*/i, "").trim();
     const personId = slug(name);
@@ -634,7 +698,6 @@ function parseScheduleCSV(text){
       const raw = (rows[i][dayIdx[d]]||"").trim();
       if(!raw) { entries[personId][d] = null; return; }
 
-      // Normalize obvious OFF
       if(raw.toUpperCase() === "OFF"){
         templateRawSet.add("OFF");
         entries[personId][d] = idForRaw("OFF");
@@ -645,12 +708,10 @@ function parseScheduleCSV(text){
     });
   }
 
-  // Build templates from raw cells
   const templates = Array.from(templateRawSet)
     .filter(Boolean)
     .map(raw => normalizeTemplate({ id: idForRaw(raw), raw }));
 
-  // Ensure some defaults exist
   defaultTemplates().forEach(t=>{
     if(!templates.some(x=>x.id===t.id)) templates.push(normalizeTemplate(t));
   });
@@ -658,11 +719,11 @@ function parseScheduleCSV(text){
   return { weekOf, roster, templates, entries };
 }
 
-/* Export */
+/* ---------------- Export CSV (current views) ---------------- */
 
 function exportCurrentToCSV(){
-  const sched = state.schedules[state.currentWeekOf];
-  if(!sched){ toast("No published schedule for this week."); return; }
+  const sched = getActiveScheduleForViews();
+  if(!sched?.roster?.length){ toast("No schedule to export."); return; }
 
   const header = ["TEAM MEMBER", ...DAYS];
   const lines = [header];
@@ -682,17 +743,7 @@ function exportCurrentToCSV(){
   toast("CSV exported.");
 }
 
-/* Helpers */
-
-function loadSchedules(){
-  try{
-    const raw = localStorage.getItem(LS_KEYS.SCHEDULES);
-    return raw ? JSON.parse(raw) : {};
-  }catch{ return {}; }
-}
-function saveSchedules(obj){
-  localStorage.setItem(LS_KEYS.SCHEDULES, JSON.stringify(obj));
-}
+/* ---------------- Template parsing ---------------- */
 
 function defaultTemplates(){
   return [
@@ -713,35 +764,24 @@ function parseCell(raw){
   if(!s) return { type:"EMPTY", label:"", site:"", start:"", end:"" };
   if(s.toUpperCase() === "OFF") return { type:"OFF", label:"OFF", site:"", start:"", end:"" };
 
-  // Typical formats in your sheet:
-  // "XR (Val)  07:50- 04:20"
-  // "Yasmeh (SFS)  07:50- 04:20"
-  // "Sugi (ELA)  07:50- 05:00 PM"
-  // "TRAINING   08:00- 04:30"
-  // "(Valencia)  08:00- 04:30"  <-- sometimes just site in parens
   let label = s;
   let site = "";
 
-  // Capture "(SITE)" if present
   const siteMatch = s.match(/\(([^\)]+)\)/);
   if(siteMatch) site = siteMatch[1].trim();
 
-  // Capture time range: "07:50- 04:20" with optional AM/PM on end
   const timeMatch = s.match(/(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})(?:\s*(AM|PM))?/i);
   let start = "", end = "";
   if(timeMatch){
-    start = normalizeTime(timeMatch[1]);
-    end = normalizeTime(timeMatch[2], timeMatch[3]); // if end has AM/PM
+    start = (timeMatch[1]||"").trim();
+    end = (timeMatch[2]||"").trim();
   }
 
-  // Label: everything before first "(" or before time range
   if(siteMatch){
     label = s.slice(0, siteMatch.index).trim();
   }else if(timeMatch){
     label = s.slice(0, timeMatch.index).trim();
   }
-
-  // If label is empty but we had (site), use site as label
   if(!label && site) label = site;
 
   const upper = label.toUpperCase();
@@ -754,25 +794,20 @@ function parseCell(raw){
   return { type, label, site, start, end };
 }
 
-function normalizeTime(hhmm, ampm){
-  // keep as HH:MM for display; if ampm provided we keep it in display later (simple)
-  const t = (hhmm||"").trim();
-  if(!t) return "";
-  return t; // intentionally simple (no 24h conversion needed for your sheet use)
-}
-
 function templateTextById(sched, id){
-  const t = (sched.templates || state.templates || []).find(x=>x.id===id);
+  const templates = (sched.templates || state.templates || []);
+  const t = templates.find(x=>x.id===id);
   if(!t) return "";
-  const p = (t.parsed || parseCell(t.raw));
+  const p = t.parsed || parseCell(t.raw);
   if(p.type === "OFF") return "OFF";
   const sitePart = p.site ? ` (${p.site})` : "";
   const timePart = (p.start && p.end) ? ` ${p.start}- ${p.end}` : "";
   return `${p.label}${sitePart}${timePart}`.trim();
 }
 
+/* ---------------- CSV parsing ---------------- */
+
 function csvToRows(text){
-  // Minimal CSV parser that handles quoted commas
   const lines = text.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n");
   return lines.map(parseCSVLine);
 }
@@ -782,7 +817,7 @@ function parseCSVLine(line){
   let inQ = false;
   for(let i=0; i<line.length; i++){
     const ch = line[i];
-    if(ch === '"' ){
+    if(ch === '"'){
       if(inQ && line[i+1] === '"'){ cur += '"'; i++; }
       else inQ = !inQ;
       continue;
@@ -802,22 +837,23 @@ function csvEscape(v){
   if(/[,"\n]/.test(s)) return `"${s.replace(/"/g,'""')}"`;
   return s;
 }
-
 function toISODate(mmddyyyy){
   const [mm,dd,yyyy] = mmddyyyy.split("/");
   return `${yyyy}-${mm.padStart(2,"0")}-${dd.padStart(2,"0")}`;
 }
 
+/* ---------------- Utilities ---------------- */
+
 function mondayOf(date){
   const d = new Date(date);
-  const day = d.getDay(); // 0 sun
+  const day = d.getDay();
   const diff = (day === 0 ? -6 : 1) - day;
   d.setDate(d.getDate() + diff);
   return d.toISOString().slice(0,10);
 }
 
 function dayName(date){
-  const idx = date.getDay(); // 0 Sun
+  const idx = date.getDay();
   const map = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
   const name = map[idx];
   return DAYS.includes(name) ? name : null;
@@ -834,8 +870,8 @@ function slug(name){
     .replace(/^-+|-+$/g,"")
     .slice(0,60) || uid("p");
 }
+
 function idForRaw(raw){
-  // stable-ish id based on content
   const s = (raw||"").trim().toLowerCase();
   let h = 2166136261;
   for(let i=0;i<s.length;i++){
@@ -844,6 +880,7 @@ function idForRaw(raw){
   }
   return "t_" + (h>>>0).toString(16);
 }
+
 function uid(prefix){
   return `${prefix}_${Math.random().toString(16).slice(2,10)}${Date.now().toString(16).slice(-4)}`;
 }
@@ -877,7 +914,8 @@ function escapeHtml(s){
     .replaceAll("'","&#039;");
 }
 
-/* Modal helpers */
+/* ---------------- Modal ---------------- */
+
 function openModal({title, body, foot, onAfter}){
   $("#modalTitle").textContent = title || "Modal";
   $("#modalBody").innerHTML = body || "";
