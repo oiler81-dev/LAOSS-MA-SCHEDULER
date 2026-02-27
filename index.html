@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LA Orthos | MA/XR Schedule</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logoMark" aria-hidden="true"></div>
+      <div class="brandText">
+        <div class="brandTitle">LA Orthos Schedule</div>
+        <div class="brandSub">MA + XR Weekly Assignments</div>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Schedule views">
+      <button class="tab is-active" data-view="my" role="tab" aria-selected="true">My Schedule</button>
+      <button class="tab" data-view="everyone" role="tab" aria-selected="false">Everyone</button>
+      <button class="tab" data-view="builder" role="tab" aria-selected="false">Builder</button>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <!-- Alerts -->
+    <section id="toast" class="toast" hidden></section>
+
+    <!-- My Schedule -->
+    <section id="view-my" class="view">
+      <div class="panel">
+        <div class="panelHead">
+          <h1>My Schedule</h1>
+          <div class="panelActions">
+            <button class="btn" id="btnPickMe">Select my name</button>
+            <button class="btn btnGhost" id="btnClearMe">Clear</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label>Week of</label>
+            <input id="myWeekOf" type="date" />
+          </div>
+          <div class="field grow">
+            <label>Me</label>
+            <div class="pill" id="myNamePill">Not selected</div>
+          </div>
+        </div>
+
+        <div class="cards">
+          <div class="card">
+            <div class="cardTitle">Today</div>
+            <div id="todayCard" class="cardBody muted">No schedule loaded.</div>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">This Week</div>
+            <div id="weekCards" class="weekCards"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Everyone -->
+    <section id="view-everyone" class="view" hidden>
+      <div class="panel">
+        <div class="panelHead">
+          <h1>Everyone</h1>
+          <div class="panelActions">
+            <button class="btn btnGhost" id="btnPrint">Print</button>
+            <button class="btn btnGhost" id="btnExportCSV">Export CSV</button>
+          </div>
+        </div>
+
+        <div class="filters">
+          <div class="field">
+            <label>Week of</label>
+            <input id="everyoneWeekOf" type="date" />
+          </div>
+          <div class="field">
+            <label>Role</label>
+            <select id="roleFilter">
+              <option value="ALL">All</option>
+              <option value="MA">MA</option>
+              <option value="XR">XR</option>
+            </select>
+          </div>
+          <div class="field grow">
+            <label>Search</label>
+            <input id="searchFilter" type="text" placeholder="Type a name…" />
+          </div>
+        </div>
+
+        <div class="tableWrap">
+          <table class="grid" id="everyoneGrid">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Builder -->
+    <section id="view-builder" class="view" hidden>
+      <div class="panel">
+        <div class="panelHead">
+          <h1>Builder</h1>
+          <div class="panelActions">
+            <button class="btn" id="btnImportCSV">Import weekly CSV</button>
+            <button class="btn btnGhost" id="btnEditMode">Unlock editing</button>
+          </div>
+        </div>
+
+        <div class="builderTop">
+          <div class="field">
+            <label>Week of (Monday)</label>
+            <input id="builderWeekOf" type="date" />
+          </div>
+
+          <div class="field grow">
+            <label>Status</label>
+            <div id="builderStatus" class="pill">No schedule loaded</div>
+          </div>
+
+          <div class="builderButtons">
+            <button class="btn btnGhost" id="btnValidate">Validate</button>
+            <button class="btn" id="btnPublish">Publish</button>
+          </div>
+        </div>
+
+        <div class="subPanels">
+          <div class="subPanel">
+            <div class="subHead">
+              <div class="subTitle">Templates</div>
+              <button class="btn btnSmall btnGhost" id="btnAddTemplate">Add</button>
+            </div>
+            <div id="templateList" class="templateList"></div>
+            <div class="hint">
+              Templates are auto-learned from imported CSV cells (plus whatever you add).
+              Click a schedule cell to apply a template.
+            </div>
+          </div>
+
+          <div class="subPanel grow">
+            <div class="subHead">
+              <div class="subTitle">Weekly Grid</div>
+              <div class="muted small" id="editHint">Locked (view only)</div>
+            </div>
+
+            <div class="tableWrap">
+              <table class="grid" id="builderGrid">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Modal -->
+  <div class="modal" id="modal" hidden>
+    <div class="modalBackdrop" data-close="1"></div>
+    <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modalHead">
+        <div id="modalTitle" class="modalTitle">Modal</div>
+        <button class="iconBtn" data-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="modalBody" id="modalBody"></div>
+      <div class="modalFoot" id="modalFoot"></div>
+    </div>
+  </div>
+
+  <input id="csvFile" type="file" accept=".csv,text/csv" hidden />
+
+  <script src="./app.js"></script>
+</body>
+</html>
